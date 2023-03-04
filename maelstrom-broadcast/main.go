@@ -1,0 +1,367 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"log"
+	"sync"
+	"time"
+
+	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
+)
+
+type Message struct {
+	content int
+	// t          time.Time
+	path []string
+}
+
+type DB struct {
+	db         []Message
+	hasMessage map[int]bool
+
+	lock sync.Mutex
+}
+
+func (d *DB) AddMessage(m Message) error {
+	// check if the message is already in the db
+	// for _, msg := range d.db {
+	// 	if msg.content == m.content {
+	// 		return errors.New("Message already in the db")
+	// 	}
+	// }
+
+	d.lock.Lock()
+	defer d.lock.Unlock()
+	if _, ok := d.hasMessage[m.content]; ok {
+		return errors.New("Message already in the db")
+	}
+
+	d.db = append(d.db, m)
+	d.hasMessage[m.content] = true
+	return nil
+}
+
+func (d *DB) ReadMessages() []Message {
+	// d.lock.Lock()
+	// defer d.lock.Unlock()
+
+	// toReturn := make([]Message, 0)
+	// toReturn = append(toReturn, d.db...)
+	return d.db
+}
+
+type Server struct {
+	DB
+	incomingMsgChannel chan Message
+
+	neighbors     []string
+	neighborsLock sync.Mutex
+
+	neighborsBroadcastChannels map[string]chan Message
+	nbcLock                    sync.Mutex
+
+	// nodeId -> sentMsgMap
+	sentMsgMap     map[string]map[int]bool
+	sentMsgMapLock sync.Mutex
+
+	node *maelstrom.Node
+}
+
+func (s *Server) AddBroadcastChannelForNeighbor(nodeId string) {
+	s.nbcLock.Lock()
+	defer s.nbcLock.Unlock()
+
+	s.neighborsBroadcastChannels[nodeId] = make(chan Message)
+
+	go func(n string) {
+		for _, msg := range s.ReadMessages() {
+			s.neighborsBroadcastChannels[n] <- msg
+		}
+	}(nodeId)
+
+	numWorkers := 2
+	for i := 0; i < numWorkers; i++ {
+		go s.MessageSendingWorkerForNeighbor(nodeId, s.neighborsBroadcastChannels[nodeId])
+	}
+}
+
+func (s *Server) NeighborsUpdateLoop() {
+	ticker := time.NewTicker(20 * time.Millisecond)
+	for range ticker.C {
+		for _, neighbor := range s.GetNeighbors() {
+			if _, ok := s.neighborsBroadcastChannels[neighbor]; !ok {
+				s.AddBroadcastChannelForNeighbor(neighbor)
+			}
+		}
+	}
+}
+
+func (s *Server) addToBroadcastChannels(m Message) {
+	s.nbcLock.Lock()
+	defer s.nbcLock.Unlock()
+
+	for _, ch := range s.neighborsBroadcastChannels {
+		go func(channel chan Message) {
+			channel <- m
+		}(ch)
+	}
+}
+
+func (s *Server) AddMessage(m Message) error {
+	err := s.DB.AddMessage(m)
+	if err == nil {
+		// s.broadcastChannel <- m
+		go s.addToBroadcastChannels(m)
+	}
+	return err
+}
+
+func (s *Server) MarkMessageAsSent(nodeId string, msg Message) {
+	s.sentMsgMapLock.Lock()
+	defer s.sentMsgMapLock.Unlock()
+
+	sentMsgs, ok := s.sentMsgMap[nodeId]
+	if !ok {
+		sentMsgs = make(map[int]bool)
+	}
+	sentMsgs[msg.content] = true
+	s.sentMsgMap[nodeId] = sentMsgs
+}
+
+func (s *Server) MsgSent(nodeId string, msg Message) bool {
+	s.sentMsgMapLock.Lock()
+	defer s.sentMsgMapLock.Unlock()
+
+	sentMsgs, ok := s.sentMsgMap[nodeId]
+	if !ok {
+		return false
+	}
+	val, ok := sentMsgs[msg.content]
+	return ok && val
+}
+
+func ElementInSlice(s []string, e string) bool {
+	log.Println("checking if ", e, " is in ", s)
+	for _, a := range s {
+		if a == e {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) MessageSendingWorkerForNeighbor(nodeId string, msgChan chan Message) {
+
+	for {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		msgs := func() []Message {
+			msgs := make([]Message, 0)
+			for {
+				select {
+				case msg := <-msgChan:
+					if !s.MsgSent(nodeId, msg) {
+						msgs = append(msgs, msg)
+					}
+				case <-ticker.C:
+					return msgs
+				}
+			}
+		}()
+		if len(msgs) == 0 {
+			continue
+		}
+		intarr := make([]int, 0)
+		for _, msg := range msgs {
+			intarr = append(intarr, msg.content)
+		}
+		// ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+
+		_, err := s.node.SyncRPC(ctx, nodeId, map[string]any{
+			"messages": intarr,
+			"type":     "batch_broadcast",
+		})
+		if err != nil {
+			log.Println("error sending msgs to ", nodeId, " msgs: ", msgs, " err: ", err)
+			go func(msgs []Message) {
+				for _, msg := range msgs {
+					msgChan <- msg
+				}
+			}(msgs)
+		} else {
+			go func(msgs []Message) {
+				for _, msg := range msgs {
+					s.MarkMessageAsSent(nodeId, msg)
+				}
+			}(msgs)
+		}
+		cancel()
+	}
+}
+
+func (s *Server) StartBroadcastLoop() {
+	go s.NeighborsUpdateLoop()
+}
+
+func (s *Server) SetNeighbors(topology []string) {
+	s.neighborsLock.Lock()
+	defer s.neighborsLock.Unlock()
+
+	log.Println("setting topology to ", topology)
+	s.neighbors = topology
+}
+
+func (s *Server) GetNeighbors() []string {
+	s.neighborsLock.Lock()
+	defer s.neighborsLock.Unlock()
+
+	toReturn := make([]string, len(s.neighbors))
+	copy(toReturn, s.neighbors)
+	return toReturn
+}
+
+func (s *Server) AddFromMsgChannel() {
+	for msg := range s.incomingMsgChannel {
+		go s.AddMessage(msg)
+	}
+}
+
+func (s *Server) BroadcastHandler(msg maelstrom.Message) (map[string]any, error) {
+	// Unmarshal the message body as an loosely-typed map.
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return nil, err
+	}
+	go func() {
+
+		s.incomingMsgChannel <- Message{
+			content: int(body["message"].(float64)),
+		}
+	}()
+
+	toReturn := make(map[string]any)
+	toReturn["type"] = "broadcast_ok"
+	return toReturn, nil
+}
+
+func (s *Server) BatchBroadcastHandler(msg maelstrom.Message) (map[string]any, error) {
+	// Unmarshal the message body as an loosely-typed map.
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return nil, err
+	}
+	go func() {
+		messages := body["messages"].([]interface{})
+		for _, m := range messages {
+			s.incomingMsgChannel <- Message{
+				content: int(m.(float64)),
+			}
+		}
+	}()
+
+	toReturn := make(map[string]any)
+	toReturn["type"] = "batch_broadcast_ok"
+	return toReturn, nil
+}
+
+func (s *Server) ReadHandler(msg maelstrom.Message) (map[string]any, error) {
+	// Unmarshal the message body as an loosely-typed map.
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return nil, err
+	}
+
+	toReturn := make(map[string]any)
+	toReturn["type"] = "read_ok"
+
+	msgs := s.ReadMessages()
+	data := make([]int, 0)
+	for _, m := range msgs {
+		data = append(data, m.content)
+	}
+	toReturn["messages"] = data
+	return toReturn, nil
+}
+
+func (s *Server) TopologyHandler(msg maelstrom.Message) (map[string]any, error) {
+	// Unmarshal the message body as an loosely-typed map.
+	var body map[string]any
+	if err := json.Unmarshal(msg.Body, &body); err != nil {
+		return nil, err
+	}
+	topologyBody := body["topology"].(map[string]interface{})
+	for k, v := range topologyBody {
+		if k == s.node.ID() {
+			neighbors := make([]string, 0)
+			for _, neighbor := range v.([]interface{}) {
+				neighbors = append(neighbors, neighbor.(string))
+			}
+			s.SetNeighbors(neighbors)
+		}
+	}
+	toReturn := make(map[string]any)
+	toReturn["type"] = "topology_ok"
+	return toReturn, nil
+}
+
+func main() {
+	n := maelstrom.NewNode()
+	sentMsgMap := make(map[string]map[int]bool)
+	s := &Server{
+		incomingMsgChannel:         make(chan Message),
+		neighbors:                  make([]string, 0),
+		node:                       n,
+		sentMsgMap:                 sentMsgMap,
+		neighborsBroadcastChannels: make(map[string]chan Message),
+		DB: DB{
+			hasMessage: make(map[int]bool),
+		},
+	}
+
+	n.Handle("broadcast", func(msg maelstrom.Message) error {
+		res, err := s.BroadcastHandler(msg)
+		if err != nil {
+			return err
+		}
+		return n.Reply(msg, res)
+	})
+
+	n.Handle("broadcast_ok", func(msg maelstrom.Message) error {
+		return nil
+	})
+
+	n.Handle("batch_broadcast", func(msg maelstrom.Message) error {
+		res, err := s.BatchBroadcastHandler(msg)
+		if err != nil {
+			return err
+		}
+		return n.Reply(msg, res)
+	})
+
+	n.Handle("batch_broadcast_ok", func(msg maelstrom.Message) error {
+		return nil
+	})
+
+	n.Handle("read", func(msg maelstrom.Message) error {
+		res, err := s.ReadHandler(msg)
+		if err != nil {
+			return err
+		}
+		return n.Reply(msg, res)
+	})
+	n.Handle("topology", func(msg maelstrom.Message) error {
+		res, err := s.TopologyHandler(msg)
+		if err != nil {
+			return err
+		}
+		return n.Reply(msg, res)
+	})
+
+	go s.AddFromMsgChannel()
+	go s.StartBroadcastLoop()
+	if err := n.Run(); err != nil {
+		log.Fatal(err)
+	}
+}
