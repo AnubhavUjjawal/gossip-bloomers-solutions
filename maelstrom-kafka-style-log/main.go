@@ -3,15 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"math"
-	"sync"
 	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-const timeout = 10 * time.Millisecond
+const timeout = 30 * time.Millisecond
 
 type SendRequest struct {
 	Type string `json:"type"`
@@ -58,73 +58,128 @@ type Msg struct {
 	Value  int
 }
 
+func (m Msg) String() string {
+	return fmt.Sprintf("(offset: %d value:%d)", m.Offset, m.Value)
+}
+
 type Server struct {
 	*maelstrom.Node
 
-	logsStore *maelstrom.KV
+	dataStore *maelstrom.KV
 	// logs      map[string][]Msg
 	// logsMutex sync.Mutex
 
 	// currentOffset     int
 	// currentOffsetLock sync.Mutex
 
-	commitOffsets     map[string]int
-	commitOffsetsLock sync.Mutex
+	// commitOffsets     map[string]int
+	// commitOffsetsLock sync.Mutex
 }
 
-func (s *Server) UpdateCommitOffsets(topic string, offset int) {
-	s.commitOffsetsLock.Lock()
-	defer s.commitOffsetsLock.Unlock()
+func (s *Server) UpdateCommitOffsets(topic string, offset int) error {
+	key := s.GetCommitOffsetKey(topic)
 
-	s.commitOffsets[topic] = offset
-}
-
-func (s *Server) GetCommitOffsets(topic string) int {
-	s.commitOffsetsLock.Lock()
-	defer s.commitOffsetsLock.Unlock()
-
-	return s.commitOffsets[topic]
-}
-
-func (s *Server) GetLogsOfTopic(topic string, offset int) []Msg {
-	s.logsMutex.Lock()
-	defer s.logsMutex.Unlock()
-
-	logs, ok := s.logs[topic]
-	if !ok {
-		return make([]Msg, 0)
-	}
-	for i := 0; i < len(logs); i++ {
-		if logs[i].Offset >= offset {
-			// return at most 2
-			e := int(math.Min(float64(i+2), float64(len(logs))))
-			return logs[i:e]
-		}
-	}
-	return make([]Msg, 0)
-}
-
-func (s *Server) AddToLog(topic string, msg Msg) (int, error) {
-	// s.logsMutex.Lock()
-	// defer s.logsMutex.Unlock()
-
-	// logs, ok := s.logs[topic]
-	// if !ok {
-	// 	logs = make([]Msg, 0)
-	// }
-	// msg.Offset = len(logs)
-	// logs = append(logs, msg)
-	// s.logs[topic] = logs
-
-	// return msg.Offset
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	return s.dataStore.Write(ctx, key, offset)
+}
 
-	logs, err := s.logsStore.Read(ctx, topic)
+func (s *Server) GetCommitOffsets(topic string) (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	currentOffset, err := s.dataStore.ReadInt(ctx, s.GetCommitOffsetKey(topic))
 	if err != nil {
 		return 0, err
 	}
+	return currentOffset, nil
+}
 
+func InterfaceToMsgType(i interface{}) []Msg {
+	switch i.(type) {
+	case []Msg:
+		break
+	default:
+		// log.Println("logsUntyped", i)
+		logsUntyped := i.([]interface{})
+		logs := make([]Msg, len(logsUntyped))
+		for i, logUntyped := range logsUntyped {
+			log := logUntyped.(map[string]interface{})
+			logs[i] = Msg{
+				Offset: int(log["Offset"].(float64)),
+				Value:  int(log["Value"].(float64)),
+			}
+		}
+		return logs
+	}
+	return i.([]Msg)
+}
+
+func (s *Server) GetTopicKey(topic string) string {
+	return fmt.Sprintf("topic_%s", topic)
+}
+
+func (s *Server) GetCommitOffsetKey(topic string) string {
+	return fmt.Sprintf("commit_offset_%s", topic)
+}
+
+func (s *Server) GetLogsOfTopic(topic string, offset int) ([]Msg, error) {
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	key := s.GetTopicKey(topic)
+	logsUntyped, err := s.dataStore.Read(ctx, key)
+
+	rpcErr, ok := err.(*maelstrom.RPCError)
+	if ok && rpcErr.Code == maelstrom.KeyDoesNotExist {
+		logsUntyped = make([]Msg, 0)
+		err = nil
+	} else if err != nil {
+		return make([]Msg, 0), err
+	}
+	logs := InterfaceToMsgType(logsUntyped)
+	for _, log := range logs {
+		if log.Offset >= offset {
+			e := int(math.Min(float64(log.Offset+2), float64(len(logs))))
+			return logs[log.Offset:e], nil
+		}
+	}
+	return make([]Msg, 0), nil
+}
+
+func (s *Server) AddToLog(topic string, msg Msg) (int, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	key := s.GetTopicKey(topic)
+	logsUntyped, err := s.dataStore.Read(ctx, key)
+
+	rpcErr, ok := err.(*maelstrom.RPCError)
+	if ok && rpcErr.Code == maelstrom.KeyDoesNotExist {
+		logsUntyped = make([]Msg, 0)
+		err = nil
+	} else if err != nil {
+		return 0, err
+	}
+
+	logs := InterfaceToMsgType(logsUntyped)
+	newLogs := make([]Msg, len(logs)+1)
+
+	copy(newLogs, logs)
+	msg.Offset = len(newLogs) - 1
+	newLogs[len(newLogs)-1] = msg
+
+	// log.Println("topic", topic, "logs", logs, "newLogs", newLogs, "msg", msg)
+
+	writeCtx, writeCancel := context.WithTimeout(context.Background(), timeout)
+	defer writeCancel()
+	err = s.dataStore.CompareAndSwap(
+		writeCtx,
+		key,
+		logs,
+		newLogs,
+		true,
+	)
+	return msg.Offset, err
 }
 
 func (s *Server) CreateMessage(topic string, Value int) (Msg, error) {
@@ -177,7 +232,10 @@ func (s *Server) RegisterPollHandler() {
 		}
 
 		for topic, offset := range req.Offsets {
-			logs := s.GetLogsOfTopic(topic, offset)
+			logs, err := s.GetLogsOfTopic(topic, offset)
+			if err != nil {
+				return err
+			}
 			res.Msgs[topic] = make([][]int, len(logs))
 			for i, log := range logs {
 				res.Msgs[topic][i] = []int{log.Offset, log.Value}
@@ -198,7 +256,10 @@ func (s *Server) RegisterCommitOffsetsHandler() {
 		}
 
 		for topic, offset := range req.Offsets {
-			s.UpdateCommitOffsets(topic, offset)
+			err := s.UpdateCommitOffsets(topic, offset)
+			if err != nil {
+				return err
+			}
 		}
 
 		res := EmptyResponse{
@@ -223,7 +284,12 @@ func (s *Server) RegisterListCommitOffsetsHandler() {
 		}
 
 		for _, topic := range req.Keys {
-			res.Offsets[topic] = s.GetCommitOffsets(topic)
+			off, err := s.GetCommitOffsets(topic)
+			if err == nil {
+				res.Offsets[topic] = off
+			} else {
+				res.Offsets[topic] = 0
+			}
 		}
 
 		s.Node.Reply(msg, res)
@@ -236,8 +302,8 @@ func main() {
 	server := &Server{
 		Node: node,
 		// logs:          make(map[string][]Msg),
-		commitOffsets: make(map[string]int),
-		logsStore:     maelstrom.NewLinKV(node),
+		// commitOffsets: make(map[string]int),
+		dataStore: maelstrom.NewLinKV(node),
 	}
 	server.RegisterSendHandler()
 	server.RegisterPollHandler()
